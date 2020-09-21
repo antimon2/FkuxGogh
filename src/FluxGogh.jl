@@ -1,7 +1,9 @@
 module FluxGogh
 
 using Flux: Flux, Chain, Conv, relu
+using LinearAlgebra
 using Metalhead: Colorant, Metalhead, VGG19, channelview
+using NNlib
 using Images
 # using Random
 using Statistics: mean
@@ -49,25 +51,29 @@ end
 #     results
 # end
 
-# function get_matrix(y)
-#     width, height, ch_num, batch_size = size(y)
-#     y_reshaped = reshape(y, (width * height, ch_num, batch_size))
-#     result = similar(y, (ch_num, ch_num, batch_size))
-#     for i = 1:batch_size
-#         @views result[:, :, i] .= y_reshaped[:, :, i]' * y_reshaped[:, :, i]
-#     end
-#     result ./ Float32(width * height * ch_num)
-# end
-
 function get_matrix(y)
     width, height, ch_num, batch_size = size(y)
     y_reshaped = reshape(y, (width * height, ch_num, batch_size))
-    results = [
-        y_reshaped[:, :, i]' * y_reshaped[:, :, i]
-        for i = 1:batch_size
-    ]
-    cat(results...; dims=3) ./ Float32(width * height * ch_num)
+    # result = similar(y, (ch_num, ch_num, batch_size))
+    # result = Array{eltype(y)}(undef, ch_num, ch_num, batch_size)
+    # @inbounds for i = 1:batch_size
+    #     @views LinearAlgebra.mul!(result[:, :, i], y_reshaped[:, :, i]', y_reshaped[:, :, i])
+    # end
+    # result = NNlib.batched_mul(NNlib.batched_transpose(y_reshaped), y_reshaped)
+    result = NNlib.batched_mul(permutedims(y_reshaped, (2,1,3)), y_reshaped)
+    # result = [dot(y_reshaped[:, i, k], y_reshaped[:, j, k]) for i=1:ch_num, j=1:ch_num, k=1:batch_size]
+    result ./ Float32(width * height * ch_num)
 end
+
+# function get_matrix(y)
+#     width, height, ch_num, batch_size = size(y)
+#     y_reshaped = reshape(y, (width * height, ch_num, batch_size))
+#     results = [
+#         y_reshaped[:, :, i]' * y_reshaped[:, :, i]
+#         for i = 1:batch_size
+#     ]
+#     cat(results...; dims=3) ./ Float32(width * height * ch_num)
+# end
 
 function generate_image(model, img_orig, img_style, width, nw, nh, max_iter, ir)
     img_gen = rand(Float32, (nw, nh, 3, 1)) .* 40 .- 20
@@ -76,12 +82,10 @@ end
 
 function generate_image(model, img_orig, img_style, width, nw, nh, max_iter, ir, img_gen)
     # _model = convertmodel(model)  # .|> Flux.gpu
-    _model = model  # .|> Flux.gpu
-    # _model_gpu = _model .|> Flux.gpu
-    # mids_orig = choosemids(_model, img_orig) .|> Flux.gpu
-    mids_orig = choosemids(_model, img_orig)  # .|> Flux.gpu
-    mids_style = choosemids(_model, img_style)  # .|> Flux.gpu
-    style_mats = get_matrix.(mids_style)  # .|> Flux.gpu  # == [get_matrix(y) for y in mids_orig]
+    _model = model .|> Flux.gpu
+    mids_orig = choosemids(model, img_orig) .|> Flux.gpu
+    mids_style = choosemids(model, img_style)  # .|> Flux.gpu
+    style_mats = get_matrix.(mids_style) .|> Flux.gpu  # == [get_matrix(y) for y in mids_orig]
 
     function loss(x, (y1, y2)::NTuple{2, Any})
         ŷ = choosemids(_model, x)
@@ -89,15 +93,33 @@ function generate_image(model, img_orig, img_style, width, nw, nh, max_iter, ir,
         s1 = l - l ÷ 2 + 1
         L1 = sum(Flux.Losses.mse.(ŷ[s1:end], y1[s1:end]))
         L2 = mean(Flux.Losses.mse.(get_matrix.(ŷ), y2))
-        0.005 * L1 + L2  # TODO: 係数を外部parameter化
+        0.005f0 * L1 + L2  # TODO: 係数を外部parameter化
     end
 
-    _img_gen = img_gen  # |> Flux.gpu
+    _img_gen = img_gen |> Flux.gpu
     ps = Flux.params(_img_gen)
-    opt = Flux.ADAM()
-    # TODO: ↓を繰り返して適宜結果を出力する
-    Flux.train!(loss, ps, [(_img_gen, (mids_orig, style_mats))], opt)
-    _img_gen
+    opt = Flux.ADAM(1f0, (0.9f0, 0.999f0))
+    for i in 1:5000
+        # Flux.train!(loss, ps, [(_img_gen, (mids_orig, style_mats))], opt)
+        # @info _img_gen
+        gs = Flux.gradient(ps) do
+            loss(_img_gen, (mids_orig, style_mats))
+        end
+        # @info gs
+        Flux.update!(opt, ps, gs)
+        # @info _img_gen
+        if i % 100 == 0
+            ŷ = choosemids(_model, _img_gen)
+            l = length(ŷ)
+            s1 = l - l ÷ 2 + 1
+            L1 = Flux.Losses.mse.(ŷ[s1:end], mids_orig[s1:end])
+            L2 = Flux.Losses.mse.(get_matrix.(ŷ), style_mats)
+            L = 0.005f0 * sum(L1) + mean(L2)
+            @info L1, L2, L
+            saveimage("out/sample_$(lpad(i, 4, '0')).png", _img_gen |> Flux.cpu)
+        end
+    end
+    # _img_gen
 end
 
 end # module
